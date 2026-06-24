@@ -13,7 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from __future__ import annotations
+
 import itertools
+import logging
+import os
 from typing import Any, Optional
 
 import ray
@@ -21,6 +25,49 @@ import torch
 
 from transfer_queue.storage.clients.base import TransferQueueStorageKVClient
 from transfer_queue.storage.clients.factory import StorageClientFactory
+
+
+_RDT_POOL_REGISTERED = False
+
+
+def _maybe_register_rdt_memory_pool(config: dict[str, Any]) -> None:
+    """Enable upstream Ray's NIXL pool when requested by DPB env/config."""
+    global _RDT_POOL_REGISTERED
+
+    raw_size = config.get("rdt_pool_bytes", None)
+    if raw_size is None:
+        raw_size = os.environ.get("TQ_RAY_RDT_POOL_BYTES", "")
+    raw_size = str(raw_size).strip()
+    if not raw_size or raw_size == "0":
+        return
+    if _RDT_POOL_REGISTERED:
+        return
+
+    try:
+        pool_bytes = int(raw_size)
+    except ValueError as exc:
+        raise ValueError(f"TQ_RAY_RDT_POOL_BYTES must be an integer byte count, got {raw_size!r}") from exc
+    if pool_bytes <= 0:
+        raise ValueError(f"TQ_RAY_RDT_POOL_BYTES must be positive, got {pool_bytes}")
+
+    device_name = str(
+        config.get("rdt_pool_device") or os.environ.get("TQ_RAY_RDT_POOL_DEVICE", "cpu")
+    )
+    try:
+        from ray.experimental import register_nixl_memory_pool
+    except ImportError as exc:
+        raise RuntimeError(
+            "TQ_RAY_RDT_POOL_BYTES requires upstream Ray with "
+            "ray.experimental.register_nixl_memory_pool()."
+        ) from exc
+
+    register_nixl_memory_pool(pool_bytes, torch.device(device_name))
+    _RDT_POOL_REGISTERED = True
+    logging.getLogger("RayStorageClient").info(
+        "Registered Ray RDT NIXL memory pool: bytes=%d device=%s",
+        pool_bytes,
+        device_name,
+    )
 
 
 @ray.remote(max_concurrency=8)
@@ -56,11 +103,15 @@ class RayStorageClient(TransferQueueStorageKVClient):
         if not ray.is_initialized():
             raise RuntimeError("Ray is not initialized. Please call ray.init() before creating RayStorageClient.")
 
-        # initialize actor
+        config = config or {}
+        _maybe_register_rdt_memory_pool(config)
+
         try:
             self.storage_actor = ray.get_actor("RayObjectRefStorage")
         except ValueError:
             self.storage_actor = RayObjectRefStorage.options(name="RayObjectRefStorage", get_if_exists=False).remote()
+
+        self._driver_obj_refs: dict[str, ray.ObjectRef] = {}
 
     def put(self, keys: list[str], values: list[Any]) -> Optional[list[Any]]:
         """
@@ -81,6 +132,7 @@ class RayStorageClient(TransferQueueStorageKVClient):
                 zip(values, transports, strict=False),
             )
         )
+        self._driver_obj_refs.update(zip(keys, obj_refs, strict=True))
         ray.get(self.storage_actor.put_obj_ref.remote(keys, obj_refs))
         return None
 
@@ -114,3 +166,12 @@ class RayStorageClient(TransferQueueStorageKVClient):
             custom_backend_meta (List[Any], optional): ...
         """
         ray.get(self.storage_actor.clear_obj_ref.remote(keys))
+        for key in keys:
+            self._driver_obj_refs.pop(key, None)
+
+    def pool_stats(self) -> dict[str, int]:
+        """Return small debug counters for the Ray RDT pool experiment."""
+        return {
+            "rdt_pool_registered": int(_RDT_POOL_REGISTERED),
+            "driver_obj_refs": len(self._driver_obj_refs),
+        }
