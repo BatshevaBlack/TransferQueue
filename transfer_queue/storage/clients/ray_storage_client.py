@@ -125,13 +125,36 @@ class RayStorageClient(TransferQueueStorageKVClient):
         if len(keys) != len(values):
             raise ValueError("Number of keys must match number of values")
 
-        transports = itertools.repeat("nixl")
-        obj_refs = list(
-            itertools.starmap(
-                lambda v, tx: ray.put(v, _tensor_transport=tx) if isinstance(v, torch.Tensor) else ray.put(v),
-                zip(values, transports, strict=False),
-            )
-        )
+        if all(isinstance(v, torch.Tensor) for v in values):
+            obj_refs = ray.put(values, _tensor_transport="nixl")
+            if not isinstance(obj_refs, list) or len(obj_refs) != len(values):
+                raise RuntimeError(
+                    "Expected batched ray.put(..., _tensor_transport='nixl') "
+                    f"to return {len(values)} ObjectRefs, got {type(obj_refs)}"
+                )
+        else:
+            obj_refs = [None] * len(values)
+            tensor_positions = []
+            tensor_values = []
+            for i, value in enumerate(values):
+                if isinstance(value, torch.Tensor):
+                    tensor_positions.append(i)
+                    tensor_values.append(value)
+                else:
+                    obj_refs[i] = ray.put(value)
+
+            if tensor_values:
+                tensor_refs = ray.put(tensor_values, _tensor_transport="nixl")
+                if not isinstance(tensor_refs, list) or len(tensor_refs) != len(tensor_values):
+                    raise RuntimeError(
+                        "Expected batched ray.put(..., _tensor_transport='nixl') "
+                        f"to return {len(tensor_values)} ObjectRefs, got {type(tensor_refs)}"
+                    )
+                for i, obj_ref in zip(tensor_positions, tensor_refs, strict=True):
+                    obj_refs[i] = obj_ref
+
+            assert all(ref is not None for ref in obj_refs)
+
         self._driver_obj_refs.update(zip(keys, obj_refs, strict=True))
         ray.get(self.storage_actor.put_obj_ref.remote(keys, obj_refs))
         return None
