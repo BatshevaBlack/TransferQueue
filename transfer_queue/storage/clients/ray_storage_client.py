@@ -159,22 +159,33 @@ class RayStorageClient(TransferQueueStorageKVClient):
         ray.get(self.storage_actor.put_obj_ref.remote(keys, obj_refs))
         return None
 
-    def get(self, keys: list[str], shapes=None, dtypes=None, custom_backend_meta=None) -> list[Any]:
+    def get(self, keys: list[str], shapes=None, dtypes=None, custom_backend_meta=None,
+            target_buffers: list | None = None) -> list[Any]:
         """
         Retrieve objects from remote storage.
         Args:
             keys (list): List of string keys to fetch.
             shapes (list, optional): Ignored. For compatibility with KVStorageManager.
             dtypes (list, optional): Ignored. For compatibility with KVStorageManager.
-            custom_backend_meta (list, optional): Ray object ref for each key
+            custom_backend_meta (list, optional): Ray object ref for each key.
+            target_buffers (list, optional): One pre-allocated torch.Tensor per key.
+                When provided, calls set_target_for_ref so each tensor is received
+                directly into the caller-supplied buffer (zero-copy, no cuda malloc;
+                combined with nixl_memory_pool also eliminates ibv_reg_mr).
         Returns:
             list: List of retrieved objects
         """
 
         if not isinstance(keys, list):
             raise ValueError(f"keys must be a list, but got {type(keys)}")
+        if target_buffers is not None and len(keys) != len(target_buffers):
+            raise ValueError("keys and target_buffers must have the same length")
 
         obj_refs = ray.get(self.storage_actor.get_obj_ref.remote(keys))
+        if target_buffers is not None:
+            from ray.experimental import set_target_for_ref
+            for ref, buf in zip(obj_refs, target_buffers, strict=True):
+                set_target_for_ref(ref, [buf])
         try:
             values = ray.get(obj_refs)
         except Exception as e:
