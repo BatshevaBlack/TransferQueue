@@ -53,9 +53,17 @@ checked against the running controller.
 | `simple_tcp` | SimpleStorage | ZMQ/TCP | CPU |
 | `mooncake_tcp` | MooncakeStore | `protocol: tcp` | CPU |
 | `mooncake_rdma` | MooncakeStore | `protocol: rdma` | CPU |
+| `ray_nixl` | RayStore | NIXL tensor transport, no pool | CPU |
 
-TODO: add `mooncake_gdr` (CUDA) and `raystore_nixl` once each has run successfully; their configs are kept
-commented out in the YAML. Yuanrong is not implemented yet.
+TODO: add `mooncake_gdr` (CUDA) once it has run successfully; its config is kept commented out in the YAML.
+Yuanrong is not implemented yet.
+
+**Temporary note, remove or update once the pool / no-pool setup is settled:** `ray_nixl` needs a Ray with
+NIXL tensor transport; the results so far used a patched Ray RDT image. A NIXL memory pool
+(`backend.RayStore.rdt_pool_bytes` and `rdt_pool_device`) is read only by an overlay `RayStorageClient`,
+not by this repo's client, so `ray_nixl` here is the no-pool variant. On the patched Ray, the no-pool run
+only worked with an overlay client that keeps the writer's ObjectRefs alive. Both overlays are described in
+`RUN_AND_SUBMIT.md`.
 
 ### Placement
 

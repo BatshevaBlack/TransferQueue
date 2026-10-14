@@ -48,8 +48,8 @@ log and the Ray driver log (`<jobid>-logs/ray-driver.log`).
 |--------|-------|-------|
 | `24_backend_comparison.yaml` | `simple_tcp`, `mooncake_tcp`, `mooncake_rdma` | 128 KiB to 1 GiB |
 | `24_backend_comparison_large.yaml` | same | 512 MiB, 1 GiB |
-| `26_backend_comparison_nixl_pool.yaml` | `raystore_nixl` with pool | 1 GiB |
-| `27_backend_comparison_2sizes.yaml` | the three above plus `raystore_nixl_pool` and `raystore_nixl_nopool` | 512 MiB, 1 GiB |
+| `26_backend_comparison_nixl_pool.yaml` | `ray_nixl` with pool | 1 GiB |
+| `27_backend_comparison_2sizes.yaml` | the three above plus `ray_nixl_pool` and `ray_nixl_nopool` | 512 MiB, 1 GiB |
 
 Each is a copy of `backend_comparison.yaml` with some cases commented out or added.
 

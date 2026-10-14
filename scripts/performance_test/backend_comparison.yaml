@@ -73,9 +73,22 @@ benchmark:
             local_buffer_size: 2147483648
 
 
+    # TEMPORARY note, remove or update once the pool / no-pool setup is settled:
+    # ray_nixl needs a Ray with NIXL tensor transport (the runs so far used the patched Ray RDT image).
+    # A NIXL memory pool (backend.RayStore.rdt_pool_bytes / rdt_pool_device) is read only by an overlay
+    # RayStorageClient, not by this repo's client, so this case is the no-pool variant. On the patched Ray
+    # the no-pool run only worked with an overlay client that keeps the writer's ObjectRefs alive.
+    - label: ray_nixl
+      device: cpu
+      tq_config:
+        metrics:
+          enabled: false
+        backend:
+          storage_backend: RayStore
+
     # TODO: add these cases once each has run successfully (they are untested here).
     # Yuanrong (host and RDMA transports) is not implemented in this benchmark yet.
-    # raystore_nixl also needs the Ray RDT patches and an NIXL-enabled Ray; GDR needs a CUDA RDMA node.
+    # mooncake_gdr needs a CUDA RDMA node.
 #    - label: mooncake_gdr
 #      device: cuda
 #      tq_config:
@@ -89,11 +102,3 @@ benchmark:
 #            use_gdr: true
 #            global_segment_size: 4294967296
 #            local_buffer_size: 2147483648
-
-#    - label: raystore_nixl
-#      device: cpu
-#      tq_config:
-#        metrics:
-#          enabled: false
-#        backend:
-#          storage_backend: RayStore
