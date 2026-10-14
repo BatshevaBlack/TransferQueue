@@ -407,7 +407,7 @@ def start_tq(conf: dict, device: str, plan: Plan, writers, readers, result: dict
     got.update({k: (actual["backend"].get(backend) or {}).get(k) for k in wanted if k != "storage_backend"})
     if got != wanted:
         raise RuntimeError(f"Running config differs from the requested one: requested {wanted}, running {got}")
-    if conf["backend"].get(backend, {}).get("use_gdr"):
+    if wanted.get("use_gdr"):
         checks = [(f"client_{i}", lambda a=a: a.gdr_active.remote()) for i, a in enumerate(writers + readers)]
         active, _ = run_phase("gdr_check", checks)
         if not all(active):
