@@ -41,29 +41,49 @@ All settings are in the `benchmark:` section of `backend_comparison.yaml`.
 | `ops_per_iteration`, `max_iteration_gib` | Upper bounds on operations per writer (see Test Flow) |
 | `warmup_iterations`, `measured_iterations` | Iterations per size; warmup results are discarded |
 | `placement` | `writer_nodes`, `reader_nodes`, `max_clients_per_node` |
-| `backends` | List of cases: `label`, `device` (`cpu` or `cuda`) and a normal TQ `tq_config` |
+| `writer_device`, `reader_device` | `cpu` or `cuda` (default `cpu`): where the writers' payloads and the readers' results live; one pair per run |
+| `backends` | List of cases: `label` and a normal TQ `tq_config` |
 
 Each `tq_config` is merged over the library defaults. The effective config is recorded in the JSON and
 checked against the running controller.
 
 ### Cases
 
-| Label | Backend | Transport | Device |
-|-------|---------|-----------|--------|
-| `simple_tcp` | SimpleStorage | ZMQ/TCP | CPU |
-| `mooncake_tcp` | MooncakeStore | `protocol: tcp` | CPU |
-| `mooncake_rdma` | MooncakeStore | `protocol: rdma` | CPU |
-| `ray_nixl` | RayStore | NIXL tensor transport, no pool | CPU |
+| Label | Backend | Transport |
+|-------|---------|-----------|
+| `simple_tcp` | SimpleStorage | ZMQ/TCP |
+| `mooncake_tcp` | MooncakeStore | `protocol: tcp` |
+| `mooncake_rdma` | MooncakeStore | `protocol: rdma` |
+| `ray_nixl` | RayStore | NIXL tensor transport, no pool |
 
 TODO: add `mooncake_gdr` (CUDA) once it has run successfully; its config is kept commented out in the YAML.
 Yuanrong is not implemented yet.
 
 **Temporary note, remove or update once the pool / no-pool setup is settled:** `ray_nixl` needs a Ray with
-NIXL tensor transport; the results so far used a patched Ray RDT image. A NIXL memory pool
+NIXL tensor transport; the results so far used a patched Ray RDT image. The benchmark sets
+`TQ_RDT_RECV_DEVICE` (the reader device) in every client, and only the patched receive path reads it;
+without that patch the result lands where Ray decides and `get_device_warning` is set. A NIXL memory pool
 (`backend.RayStore.rdt_pool_bytes` and `rdt_pool_device`) is read only by an overlay `RayStorageClient`,
 not by this repo's client, so `ray_nixl` here is the no-pool variant. On the patched Ray, the no-pool run
 only worked with an overlay client that keeps the writer's ObjectRefs alive. Both overlays are described in
 `RUN_AND_SUBMIT.md`.
+
+### Devices
+
+`writer_device` is where the writers create their payloads and `reader_device` is where the readers' results
+must end up. A GPU side uses one GPU per client, so for 8 GPUs on each of two nodes use `clients: 8`,
+`max_clients_per_node: 8` and `cuda` on both sides. Run once per combination.
+
+TQ's get returns whatever the backend delivers. `native_result_device()` declares where: `cpu` for
+SimpleStorage and Mooncake without GDR, the reader's own device for RayStore (NIXL). If the result is not on
+`reader_device`, the benchmark copies it there inside the timed GET, so the GET latency is the time until the
+data is on the reader's device. The copy follows the declaration alone. The first GET of every iteration
+compares the observed device with the declaration and logs a warning on a mismatch. The JSON records the
+observed device in `get_observed_device` and any mismatch in `get_device_warning`, next to
+`get_native_device` and `get_includes_copy` per case. Each size also has `put_get_gib_s`: PUT bytes over the
+summed PUT and GET phase times, since PUT alone can be only a publish step (NIXL). On the PUT side, a GPU
+payload on a backend without a GPU path is copied to the host by TQ inside the timed PUT. The writer and
+reader counts are always equal.
 
 ### Placement
 

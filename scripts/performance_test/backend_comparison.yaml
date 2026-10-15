@@ -9,6 +9,11 @@ benchmark:
   reader_mapping: paired      # paired: reader i reads writer i | shuffled: seeded one-to-one permutation
   shuffle_seed: 42            # makes the shuffled assignment repeatable; ignored for paired
 
+  # Device of the writers' payloads and of the readers' results; one pair per run.
+  # If a backend does not deliver on reader_device, a copy is added inside the timed GET.
+  writer_device: cpu          # cpu | cuda
+  reader_device: cpu          # cpu | cuda
+
   sizes:
     start_kib: 128
     count: 14                 # doubling: 128 KiB through 1 GiB
@@ -26,12 +31,11 @@ benchmark:
     reader_nodes: null
     max_clients_per_node: 1
 
-  # Per case: label, payload device (cpu | cuda) and a normal TransferQueue config.
+  # Per case: label and a normal TransferQueue config.
   # The config is merged over the library defaults. SimpleStorage total_storage_size
   # (a sample count, not bytes) is calculated as 1.25 x clients x largest ops per iteration.
   backends:
     - label: simple_tcp
-      device: cpu
       tq_config:
         metrics:
           enabled: false
@@ -42,7 +46,6 @@ benchmark:
             required_node_resource: "node:${benchmark.placement.writer_nodes.0}"
 
     - label: mooncake_tcp
-      device: cpu
       tq_config:
         metrics:
           enabled: false
@@ -59,7 +62,6 @@ benchmark:
             local_buffer_size: 2147483648     # bytes per client; must hold the largest payload
 
     - label: mooncake_rdma
-      device: cpu
       tq_config:
         backend:
           storage_backend: MooncakeStore
@@ -75,11 +77,12 @@ benchmark:
 
     # TEMPORARY note, remove or update once the pool / no-pool setup is settled:
     # ray_nixl needs a Ray with NIXL tensor transport (the runs so far used the patched Ray RDT image).
+    # The benchmark sets TQ_RDT_RECV_DEVICE (= reader_device) in every client; only the patched receive path
+    # reads it. Without that patch the result lands where Ray decides and get_device_warning is set.
     # A NIXL memory pool (backend.RayStore.rdt_pool_bytes / rdt_pool_device) is read only by an overlay
     # RayStorageClient, not by this repo's client, so this case is the no-pool variant. On the patched Ray
     # the no-pool run only worked with an overlay client that keeps the writer's ObjectRefs alive.
     - label: ray_nixl
-      device: cpu
       tq_config:
         metrics:
           enabled: false
@@ -88,9 +91,8 @@ benchmark:
 
     # TODO: add these cases once each has run successfully (they are untested here).
     # Yuanrong (host and RDMA transports) is not implemented in this benchmark yet.
-    # mooncake_gdr needs a CUDA RDMA node.
+    # mooncake_gdr needs a CUDA RDMA node and writer_device and reader_device set to cuda.
 #    - label: mooncake_gdr
-#      device: cuda
 #      tq_config:
 #        backend:
 #          storage_backend: MooncakeStore

@@ -107,11 +107,24 @@ def _probe(key: str, marker: str) -> tuple[int, int, int, int]:
     return (h >> 8) % 256, (h >> 16) % 256, (h >> 24) % 256, h % 251
 
 
+def native_result_device(backend: str, reader_device: str) -> str:
+    """Device TQ's get delivers results on. It decides whether the GET copies to the reader's device;
+    a different observed device on the first GET of an iteration only logs a warning."""
+    if backend == "RayStore":
+        return reader_device  # NIXL receives straight onto the reader's device
+    return "cpu"  # SimpleStorage and Mooncake without GDR return host tensors
+
+
 class Client:
     """One TQ client process; payload generation, storage calls and validation stay here."""
 
-    def __init__(self, device: str):
-        self.device = device
+    def __init__(self, device: str, native: str):
+        self.device = device  # where this client's payloads (writer) or results (reader) live
+        self.native = native
+        self.landed = None
+        self.device_warning = None
+        # Read by the patched Ray NIXL receive path to pick the destination device; ignored elsewhere.
+        os.environ["TQ_RDT_RECV_DEVICE"] = device
         self.payloads = {}
         if device == "cuda":
             torch.zeros(1, device="cuda")  # CUDA must exist before the client decides on the GDR path
@@ -145,21 +158,31 @@ class Client:
         times = []
         for i, key in enumerate(keys):
             start = time.perf_counter()
-            out = tq.kv_batch_get(key, partition, select_fields="data")
+            data = tq.kv_batch_get(key, partition, select_fields="data")["data"]
+            landed = data.device.type
+            if self.native != self.device:
+                data = data.to(self.device)  # the backend is declared not to deliver on the reader's device
             self._sync()
             times.append(time.perf_counter() - start)
-            if i == 0:  # only the first GET of an iteration is validated
-                self._validate(out, key, marker, size)
-            del out
+            if i == 0:  # only the first GET of an iteration is checked and validated
+                self.landed = landed
+                if landed != self.native and self.device_warning is None:
+                    self.device_warning = f"{key}: backend returned {landed}, declared {self.native}"
+                    logger.warning(self.device_warning)
+                self._validate(data, key, marker, size)
+            del data
         return times
 
-    def _validate(self, out, key: str, marker: str, size: int) -> None:
-        sample = out["data"][0]  # dense and nested returns both index to the single logical sample
+    def _validate(self, data, key: str, marker: str, size: int) -> None:
+        sample = data[0]  # dense and nested returns both index to the single logical sample
         if sample.dtype != torch.uint8 or tuple(sample.shape) != (size,):
             raise ValueError(f"{key}: got {sample.dtype} {tuple(sample.shape)}, expected uint8 ({size},)")
         got = (sample[0].item(), sample[size // 2].item(), sample[-1].item())
         if got != _probe(key, marker)[:3]:
             raise ValueError(f"{key}: stale or corrupt data, first/middle/last bytes {got}")
+
+    def landing(self) -> dict:
+        return {"observed": self.landed, "warning": self.device_warning}
 
     def clear(self, partition: str) -> None:
         tq.kv_clear(list(self.payloads), partition)
@@ -208,6 +231,8 @@ class Plan:
     warmup: int
     measured: int
     nodes: dict  # node ip -> Ray resources
+    writer_device: str
+    reader_device: str
 
 
 def make_plan(b) -> Plan:
@@ -239,6 +264,10 @@ def make_plan(b) -> Plan:
     else:
         raise ValueError(f"reader_mapping must be paired or shuffled, got {b.reader_mapping}")
 
+    writer_device, reader_device = b.get("writer_device", "cpu"), b.get("reader_device", "cpu")
+    if {writer_device, reader_device} - {"cpu", "cuda"}:
+        raise ValueError(f"writer_device and reader_device must be cpu or cuda, got {writer_device}, {reader_device}")
+
     sizes = [b.sizes.start_kib * 1024 * 2**i for i in range(b.sizes.count)]
     max_iter_bytes = int(b.max_iteration_gib * GIB)
     ops = {s: max(1, min(b.ops_per_iteration, max_iter_bytes // s)) for s in sizes}
@@ -252,17 +281,25 @@ def make_plan(b) -> Plan:
         b.warmup_iterations,
         b.measured_iterations,
         nodes,
+        writer_device,
+        reader_device,
     )
 
 
-def preflight(conf, device: str, plan: Plan, result: dict) -> str | None:
+def preflight(conf, plan: Plan, result: dict) -> str | None:
     """Return the reason this case cannot run, or None. Fills result["capacity"] and the versions."""
+    writer_device, reader_device = plan.writer_device, plan.reader_device
     backend = conf.backend.storage_backend
     bconf = conf.backend.get(backend) or {}
     storage_node = (bconf.get("required_node_resource") or "")[len("node:") :]
     ips = sorted({*plan.writer_ips, *plan.reader_ips, *([storage_node] if storage_node else [])})
+    gpu_load = Counter()  # GPU clients per node
+    gpu_load.update(ip for ip in plan.writer_ips if writer_device == "cuda")
+    gpu_load.update(ip for ip in plan.reader_ips if reader_device == "cuda")
     refs = [
-        node_info.options(num_gpus=int(device == "cuda"), resources={f"node:{ip}": 0.001}).remote(device)
+        node_info.options(num_gpus=int(ip in gpu_load), resources={f"node:{ip}": 0.001}).remote(
+            "cuda" if ip in gpu_load else "cpu"
+        )
         for ip in ips
     ]
     info = dict(zip(ips, ray.get(refs), strict=True))
@@ -272,7 +309,7 @@ def preflight(conf, device: str, plan: Plan, result: dict) -> str | None:
     package = PACKAGES.get(backend)
     if package and not all(info[ip]["packages"][package] for ip in load):
         return f"Python package '{package}' is missing on a client node"
-    if device == "cuda" and any(plan.nodes[ip].get("GPU", 0) < n for ip, n in load.items()):
+    if any(plan.nodes[ip].get("GPU", 0) < n for ip, n in gpu_load.items()):
         return "a client node has fewer GPUs than clients"
     needs_rdma = backend == "MooncakeStore" and bconf.protocol == "rdma"
     if needs_rdma and not all(info[ip]["rdma"] for ip in load):
@@ -285,9 +322,10 @@ def preflight(conf, device: str, plan: Plan, result: dict) -> str | None:
     result["capacity"] = {"data_bytes_required": data}
 
     # Writers hold their input buffers; readers hold one result plus one temporary copy.
-    buffers = [(ip, live) for ip in plan.writer_ips] + [(ip, 2 * largest) for ip in plan.reader_ips]
+    buffers = [(ip, live, writer_device) for ip in plan.writer_ips]
+    buffers += [(ip, 2 * largest, reader_device) for ip in plan.reader_ips]
     need = Counter()  # host memory per node
-    for ip, size in buffers:
+    for ip, size, device in buffers:
         if device == "cuda":
             if size > info[ip]["gpu_free"]:
                 return f"GPU memory on {ip}: need {size / GIB:.1f} GiB, free {info[ip]['gpu_free'] / GIB:.1f} GiB"
@@ -367,6 +405,7 @@ def run_size(label: str, writers, readers, plan: Plan, size: int) -> dict:
         {"put_s": put_s, "get_s": get_s, "put_calls": [len(t) for t in put_t], "get_calls": [len(t) for t in get_t]}
         for put_t, put_s, get_t, get_s in iterations
     ]
+    phase_s = {}
     for op, times_idx, secs_idx in (("put", 0, 1), ("get", 2, 3)):
         hist = Histogram()
         for it in iterations:
@@ -375,6 +414,7 @@ def run_size(label: str, writers, readers, plan: Plan, size: int) -> dict:
                     hist.add(t)
         total_bytes = hist.n * size
         total_s = sum(it[secs_idx] for it in iterations)
+        phase_s[op] = total_s
         out[op] = {
             "calls": hist.n,
             "bytes": total_bytes,
@@ -382,6 +422,8 @@ def run_size(label: str, writers, readers, plan: Plan, size: int) -> dict:
             "latency": hist.summary(),
             "latency_buckets": hist.counts,
         }
+    # PUT alone can be a publish step (NIXL), so also report bytes over the summed PUT and GET phase times.
+    out["put_get_gib_s"] = out["put"]["bytes"] / (phase_s["put"] + phase_s["get"]) / GIB
     return out
 
 
@@ -394,7 +436,7 @@ def service_placement() -> dict:
     return services
 
 
-def start_tq(conf: dict, device: str, plan: Plan, writers, readers, result: dict) -> None:
+def start_tq(conf: dict, writers, readers, result: dict) -> None:
     run_phase("init", [("writer_0", lambda: writers[0].init_tq.remote(conf))])  # the owner creates the services
     attached = writers[1:] + readers
     run_phase("attach", [(f"client_{i}", lambda a=a: a.init_tq.remote()) for i, a in enumerate(attached)])
@@ -457,7 +499,6 @@ def _tq_actor_names() -> list[str]:
 
 
 def run_case(case, plan: Plan, result: dict, save) -> None:
-    device = case.device
     conf = OmegaConf.merge(
         OmegaConf.load(resources.files("transfer_queue") / "config.yaml"),
         OmegaConf.create(OmegaConf.to_container(case.tq_config, resolve=True)),
@@ -468,7 +509,7 @@ def run_case(case, plan: Plan, result: dict, save) -> None:
     conf = OmegaConf.to_container(conf, resolve=True)
     result["effective_tq_config"] = conf
 
-    reason = preflight(OmegaConf.create(conf), device, plan, result)
+    reason = preflight(OmegaConf.create(conf), plan, result)
     if reason:
         result.update(status="skipped", reason=reason)
         return
@@ -481,20 +522,29 @@ def run_case(case, plan: Plan, result: dict, save) -> None:
     else:
         client_cls = ray.remote(Client)
 
-    def spawn(ip):
-        opts = {"num_cpus": 1, "num_gpus": int(device == "cuda"), "resources": {f"node:{ip}": 0.001}}
-        return client_cls.options(**opts).remote(device)
+    native = native_result_device(conf["backend"]["storage_backend"], plan.reader_device)
+    result["get_native_device"] = native
+    result["get_includes_copy"] = native != plan.reader_device
 
-    writers = [spawn(ip) for ip in plan.writer_ips]
-    readers = [spawn(ip) for ip in plan.reader_ips]
+    def spawn(ip, device):
+        opts = {"num_cpus": 1, "num_gpus": int(device == "cuda"), "resources": {f"node:{ip}": 0.001}}
+        return client_cls.options(**opts).remote(device, native)
+
+    writers = [spawn(ip, plan.writer_device) for ip in plan.writer_ips]
+    readers = [spawn(ip, plan.reader_device) for ip in plan.reader_ips]
     result["sizes"] = []
     try:
-        start_tq(conf, device, plan, writers, readers, result)
+        start_tq(conf, writers, readers, result)
         for size in plan.sizes:
             result["sizes"].append(run_size(case.label, writers, readers, plan, size))
             save()
             if not result["sizes"][-1]["cleanup_verified"]:
                 raise PhaseError("verify_cleanup", "writer_0", "keys remain after clear", size)
+        landings = ray.get([r.landing.remote() for r in readers])
+        observed = sorted({x["observed"] for x in landings})
+        result["get_observed_device"] = observed[0] if len(observed) == 1 else observed
+        warnings = [x["warning"] for x in landings if x["warning"]]
+        result["get_device_warning"] = warnings[0] if warnings else None
         result["status"] = "ok"
     except Exception as e:
         err = e if isinstance(e, PhaseError) else PhaseError("setup", "driver", repr(e))
@@ -539,9 +589,11 @@ def main() -> None:
             "reader_to_writer": plan.assignment,
         },
         "requested_placement": {"writer_nodes": plan.writer_ips, "reader_nodes": plan.reader_ips},
+        "devices": {"writer": plan.writer_device, "reader": plan.reader_device},
         "units": {
             "latency": "ms; count = timed calls at that size, all clients and measured iterations (no warmup)",
             "throughput_gib_s": "GiB/s; bytes of completed calls / total measured phase time",
+            "put_get_gib_s": "GiB/s; put bytes / (total measured PUT phase time + total measured GET phase time)",
             "iteration put_s/get_s": "seconds",
         },
         "histogram": {
@@ -557,7 +609,7 @@ def main() -> None:
     }
     save = lambda: write_json(output, doc)  # noqa: E731
     for case in b.backends:
-        result = {"label": case.label, "device": case.device, "status": "running"}
+        result = {"label": case.label, "status": "running"}
         doc["cases"].append(result)
         try:
             run_case(case, plan, result, save)

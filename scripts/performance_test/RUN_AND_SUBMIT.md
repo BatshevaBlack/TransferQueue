@@ -60,7 +60,12 @@ Each is a copy of `backend_comparison.yaml` with some cases commented out or add
   Ray NIXL memory pool registration. The pool is enabled by `backend.RayStore.rdt_pool_bytes` and
   `rdt_pool_device` in the case's `tq_config`; leave them out for the no-pool case.
 - The benchmark creates its client actors with `enable_tensor_transport=True` for RayStore.
-- With NIXL, PUT only publishes the tensor; the data moves on GET. Compare PUT + GET time, not PUT alone.
+- With NIXL, PUT only publishes the tensor; the data moves on GET. Compare PUT + GET time (`put_get_gib_s`), not PUT alone.
+- The benchmark sets `TQ_RDT_RECV_DEVICE` (the reader device) in every client. Only a patched receive path reads it:
+  `30_nixl_tensor_transport_recv_device.py` is the mounted `nixl_tensor_transport.py` with that change; pass it to
+  `25_backend_comparison_fix3ideal.sh` as `NIXL_TRANSPORT_OVERLAY`. Without it a CPU reader that sees CUDA gets
+  GPU results and `get_device_warning` is set.
+- CPU writer with a GPU reader also needs `RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0` in the submit environment.
 
 ## Notes
 
