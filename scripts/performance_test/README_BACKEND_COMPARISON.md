@@ -75,7 +75,7 @@ must end up. A GPU side uses one GPU per client, so for 8 GPUs on each of two no
 `max_clients_per_node: 8` and `cuda` on both sides. Run once per combination.
 
 TQ's get returns whatever the backend delivers. `native_result_device()` declares where: `cpu` for
-SimpleStorage and Mooncake without GDR, the reader's own device for RayStore (NIXL). If the result is not on
+SimpleStorage and Mooncake without GDR, `cuda` for Mooncake with `use_gdr`, the reader's own device for RayStore (NIXL). If the result is not on
 `reader_device`, the benchmark copies it there inside the timed GET, so the GET latency is the time until the
 data is on the reader's device. The copy follows the declaration alone. The first GET of every iteration
 compares the observed device with the declaration and logs a warning on a mismatch. The JSON records the

@@ -107,11 +107,14 @@ def _probe(key: str, marker: str) -> tuple[int, int, int, int]:
     return (h >> 8) % 256, (h >> 16) % 256, (h >> 24) % 256, h % 251
 
 
-def native_result_device(backend: str, reader_device: str) -> str:
+def native_result_device(backend: dict, reader_device: str) -> str:
     """Device TQ's get delivers results on. It decides whether the GET copies to the reader's device;
     a different observed device on the first GET of an iteration only logs a warning."""
-    if backend == "RayStore":
+    name = backend["storage_backend"]
+    if name == "RayStore":
         return reader_device  # NIXL receives straight onto the reader's device
+    if name == "MooncakeStore" and backend["MooncakeStore"].get("use_gdr"):
+        return "cuda"  # the GDR path unpacks into CUDA tensors
     return "cpu"  # SimpleStorage and Mooncake without GDR return host tensors
 
 
@@ -522,7 +525,7 @@ def run_case(case, plan: Plan, result: dict, save) -> None:
     else:
         client_cls = ray.remote(Client)
 
-    native = native_result_device(conf["backend"]["storage_backend"], plan.reader_device)
+    native = native_result_device(conf["backend"], plan.reader_device)
     result["get_native_device"] = native
     result["get_includes_copy"] = native != plan.reader_device
 
