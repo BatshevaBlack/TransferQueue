@@ -55,8 +55,10 @@ checked against the running controller.
 | `mooncake_tcp` | MooncakeStore | `protocol: tcp` |
 | `mooncake_rdma` | MooncakeStore | `protocol: rdma` |
 | `ray_nixl` | RayStore | NIXL tensor transport, no pool |
+| `mooncake_gdr` | MooncakeStore | `protocol: rdma`, `use_gdr: true` (GPU writer and GPU reader only) |
 
-TODO: add `mooncake_gdr` (CUDA) once it has run successfully; its config is kept commented out in the YAML.
+`mooncake_gdr` needs `writer_device` and `reader_device` set to `cuda`; with any other pair its setup check
+fails because the GDR path is not active on every client.
 Yuanrong is not implemented yet.
 
 **Temporary note, remove or update once the pool / no-pool setup is settled:** `ray_nixl` needs a Ray with
