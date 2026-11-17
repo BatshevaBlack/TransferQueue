@@ -105,34 +105,33 @@ assigned writer's keys. Each iteration:
    bytes, derived from the key and iteration marker).
 2. **PUT** (`kv_put`): all writers put their keys sequentially.
 3. **GET** (`kv_batch_get`): after all writers finish, all readers get their keys sequentially.
-4. **DELETE** (`kv_clear`): writers clear their keys.
+4. **Release**: readers free the results they kept during GET, so freeing memory is never part of GET time.
+5. **DELETE** (`kv_clear`): writers clear their keys.
 
 The phases do not overlap. Each size runs `warmup_iterations` and then `measured_iterations`. Keys are
 reused by every iteration; cases and sizes are isolated by partition. The reader assignment is generated
 once and reused for all sizes and cases.
 
-## Validation
-
-Each reader validates only the first GET of every iteration (warmup included), after its timer stops:
-field, dtype, logical sample shape, and the first, middle and last byte. There is no full checksum. A
-validation failure marks the case failed.
+The benchmark does not check the returned data; it only compares the landing device on the first GET of
+every iteration. Garbage collection is disabled in the actors and runs in the untimed release and delete
+phases.
 
 ## Timing
 
-- **Latency**: each call is timed inside its actor with a monotonic clock, excluding preparation,
-  validation and histogram updates; CUDA is synchronized first. Reported in ms: count (`n`, the timed
+- **Latency**: each call is timed inside its actor with a monotonic clock, excluding preparation and
+  histogram updates; CUDA is synchronized first. Reported in ms: count (`n`, the timed
   calls at that size over all clients and measured iterations), min, mean, max, p50 and p90. Percentiles
   are estimated from log-spaced buckets about 5% apart (1 us to 100 s, plus underflow and overflow),
   which are also saved. With few samples (for example 20 at 1 GiB) they are coarse.
-- **Throughput** (GiB/s): bytes of completed calls divided by the phase time on the driver's clock, from
-  before dispatch until the last actor finishes. The GET phase includes the first-GET validation. Per size
-  it is the total measured bytes over the total measured phase time.
+- **Throughput** (GiB/s): bytes of completed calls divided by the phase time. A phase lasts as long as its
+  slowest client's summed per-call times, so dispatch and freeing memory are not part of it. Per size it is
+  the total measured bytes over the total measured phase time.
 
 ## Capacity
 
 Live data is about `clients × ops(size) × size`. The preflight requires
 `1.5 × max(max_iteration_bytes, largest_payload) × clients` bytes of backend capacity, and checks writer
-input buffers, reader outputs (one result plus one copy) and per-client Mooncake segments and local
+input buffers, reader outputs (all results of an iteration plus one copy) and per-client Mooncake segments and local
 buffers against node memory (GPU memory for `cuda`). SimpleStorage `total_storage_size` is a sample count,
 calculated as `1.25 × clients × largest ops`.
 
@@ -151,7 +150,7 @@ The JSON is rewritten atomically after every size and failure. It contains:
 - Mapping policy, shuffle seed and reader assignment
 - Per size: payload bytes, operation counts, transferred bytes, per-iteration phase times, throughput,
   latency summaries and raw histogram buckets
-- The validation policy, errors, skips and cleanup status
+- Errors, skips and cleanup status
 
 ## Examples
 

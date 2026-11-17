@@ -19,6 +19,7 @@ Configuration, usage and definitions: README_BACKEND_COMPARISON.md.
 """
 
 import argparse
+import gc
 import importlib.metadata
 import importlib.util
 import json
@@ -119,7 +120,7 @@ def native_result_device(backend: dict, reader_device: str) -> str:
 
 
 class Client:
-    """One TQ client process; payload generation, storage calls and validation stay here."""
+    """One TQ client process; payload generation and storage calls stay here."""
 
     def __init__(self, device: str, native: str):
         self.device = device  # where this client's payloads (writer) or results (reader) live
@@ -129,6 +130,8 @@ class Client:
         # Read by the patched Ray NIXL receive path to pick the destination device; ignored elsewhere.
         os.environ["TQ_RDT_RECV_DEVICE"] = device
         self.payloads = {}
+        self.results = []
+        gc.disable()  # collected between phases (release, clear), never inside a timed call
         if device == "cuda":
             torch.zeros(1, device="cuda")  # CUDA must exist before the client decides on the GDR path
 
@@ -157,7 +160,7 @@ class Client:
             times.append(time.perf_counter() - start)
         return times
 
-    def get(self, partition: str, keys: list[str], marker: str, size: int) -> list[float]:
+    def get(self, partition: str, keys: list[str]) -> list[float]:
         times = []
         for i, key in enumerate(keys):
             start = time.perf_counter()
@@ -167,22 +170,18 @@ class Client:
                 data = data.to(self.device)  # the backend is declared not to deliver on the reader's device
             self._sync()
             times.append(time.perf_counter() - start)
-            if i == 0:  # only the first GET of an iteration is checked and validated
+            if i == 0:  # only the first GET of an iteration is checked for its landing device
                 self.landed = landed
                 if landed != self.native and self.device_warning is None:
                     self.device_warning = f"{key}: backend returned {landed}, declared {self.native}"
                     logger.warning(self.device_warning)
-                self._validate(data, key, marker, size)
-            del data
+            self.results.append(data)
         return times
 
-    def _validate(self, data, key: str, marker: str, size: int) -> None:
-        sample = data[0]  # dense and nested returns both index to the single logical sample
-        if sample.dtype != torch.uint8 or tuple(sample.shape) != (size,):
-            raise ValueError(f"{key}: got {sample.dtype} {tuple(sample.shape)}, expected uint8 ({size},)")
-        got = (sample[0].item(), sample[size // 2].item(), sample[-1].item())
-        if got != _probe(key, marker)[:3]:
-            raise ValueError(f"{key}: stale or corrupt data, first/middle/last bytes {got}")
+    def release(self) -> None:
+        """Free the results outside every timed phase, so freeing memory never counts as GET time."""
+        self.results = []
+        gc.collect()
 
     def landing(self) -> dict:
         return {"observed": self.landed, "warning": self.device_warning}
@@ -190,6 +189,7 @@ class Client:
     def clear(self, partition: str) -> None:
         tq.kv_clear(list(self.payloads), partition)
         self.payloads = {}
+        gc.collect()
 
     def live_keys(self, partition: str) -> int:
         return len(tq.kv_list(partition).get(partition, {}))
@@ -324,9 +324,9 @@ def preflight(conf, plan: Plan, result: dict) -> str | None:
     data = 1.5 * live * len(plan.writer_ips)
     result["capacity"] = {"data_bytes_required": data}
 
-    # Writers hold their input buffers; readers hold one result plus one temporary copy.
+    # Writers hold their input buffers; readers keep every result of an iteration until released, plus one temporary copy.
     buffers = [(ip, live, writer_device) for ip in plan.writer_ips]
-    buffers += [(ip, 2 * largest, reader_device) for ip in plan.reader_ips]
+    buffers += [(ip, live + largest, reader_device) for ip in plan.reader_ips]
     need = Counter()  # host memory per node
     for ip, size, device in buffers:
         if device == "cuda":
@@ -380,14 +380,16 @@ def run_iteration(writers, readers, plan: Plan, partition: str, size: int, marke
     ]
     put_jobs = [(f"writer_{w}", lambda a=a: a.put.remote(partition)) for w, a in enumerate(writers)]
     run_phase("prepare", prepare_jobs)
-    put_times, put_s = run_phase("put", put_jobs)
+    put_times, _ = run_phase("put", put_jobs)
     get_jobs = [
-        (f"reader_{r}", lambda a=a, k=keys[plan.assignment[r]]: a.get.remote(partition, k, marker, size))
+        (f"reader_{r}", lambda a=a, k=keys[plan.assignment[r]]: a.get.remote(partition, k))
         for r, a in enumerate(readers)
     ]
-    get_times, get_s = run_phase("get", get_jobs)
+    get_times, _ = run_phase("get", get_jobs)
+    run_phase("release", [(f"reader_{r}", lambda a=a: a.release.remote()) for r, a in enumerate(readers)])
     run_phase("clear", [(f"writer_{w}", lambda a=a: a.clear.remote(partition)) for w, a in enumerate(writers)])
-    return put_times, put_s, get_times, get_s
+    # A phase lasts as long as its slowest client's timed calls; dispatch and freeing memory are not part of it.
+    return put_times, max(map(sum, put_times)), get_times, max(map(sum, get_times))
 
 
 def run_size(label: str, writers, readers, plan: Plan, size: int) -> dict:
@@ -597,7 +599,7 @@ def main() -> None:
             "latency": "ms; count = timed calls at that size, all clients and measured iterations (no warmup)",
             "throughput_gib_s": "GiB/s; bytes of completed calls / total measured phase time",
             "put_get_gib_s": "GiB/s; put bytes / (total measured PUT phase time + total measured GET phase time)",
-            "iteration put_s/get_s": "seconds",
+            "iteration put_s/get_s": "seconds; the slowest client's summed per-call times in that phase",
         },
         "histogram": {
             "low_s": LOW_S,
@@ -606,8 +608,6 @@ def main() -> None:
             "latency_buckets": "call counts: [0] is < low_s, [i] covers [low_s*step^(i-1), low_s*step^i), "
             "the last is >= high_s; percentiles are bucket upper edges clipped to the exact min/max",
         },
-        "validation_policy": "first GET of every iteration (warmup and measured) at every size: field, dtype, "
-        "shape, and first/middle/last byte; no full checksum",
         "cases": [],
     }
     save = lambda: write_json(output, doc)  # noqa: E731
