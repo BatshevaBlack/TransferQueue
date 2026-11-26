@@ -15,7 +15,7 @@ controller:
 
 backend:
   # Pluggable storage/transport backend of TransferQueue. Choose from:
-  # SimpleStorage, Yuanrong, MooncakeStore, ...
+  # SimpleStorage, Yuanrong, MooncakeStore, NixlStore, ...
   storage_backend: SimpleStorage
 
   # SimpleStorage: ZMQ-based in-memory storage for out-of-the-box usage
@@ -147,3 +147,30 @@ backend:
 
   # For RayStore:
   RayStore:
+
+  # NixlStore: KV backend for NIXL Store services.
+  NixlStore:
+    # false preserves externally managed mode. When true, the TQ init owner
+    # starts one Store Manager and one NSClient sidecar per alive Ray node.
+    auto_init: false
+    # Local Unix socket of the NSClient sidecar.
+    socket_path: /run/nixl-store/nsclient.sock
+    # Stable NIXL Store namespace for this TransferQueue deployment.
+    namespace: transfer-queue
+    # Adapter chunk size. The current NIXL Store binding maximum is 4096 items.
+    max_batch_items: 4096
+    # Used only when auto_init is true. Port 0 asks TQ to choose a free port.
+    manager_address: 127.0.0.1:0
+    manager_binary: nixl-store-manager
+    nsclient_binary: nixl-store-nsclient
+    socket_dir: /tmp/nixl-store
+    startup_timeout_seconds: 60
+    shutdown_timeout_seconds: 10
+    # Optional path to a nixl-store-nsclient TOML file for memory sizing.
+    # null uses the NSClient built-in defaults.
+    nsclient_config: null
+    # Environment overrides for TQ-owned Store Manager/NSClient processes.
+    # Useful while NIXL Store native libraries/plugins are not package-discoverable.
+    process_env: {}
+    # Filled by auto_init and read by clients on each node.
+    runtime_socket_paths: {}

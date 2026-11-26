@@ -16,6 +16,7 @@
 from .managers import (
     AsyncSimpleStorageManager,
     MooncakeStorageManager,
+    NixlStoreManager,
     RayStorageManager,
     StorageManager,
     StorageManagerFactory,
@@ -31,6 +32,7 @@ __all__ = [
     "StorageManagerFactory",
     "AsyncSimpleStorageManager",
     "MooncakeStorageManager",
+    "NixlStoreManager",
     "YuanrongStorageManager",
     "RayStorageManager",
 ]
