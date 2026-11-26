@@ -54,6 +54,7 @@ from transfer_queue.metadata import KVBatchMeta
 from transfer_queue.sampler import *  # noqa: F401
 from transfer_queue.sampler import BaseSampler
 from transfer_queue.storage.bootstrap import StorageBootstrapProvider
+from transfer_queue.storage.bootstrap.nixl_store_bootstrap import cleanup_nixl_store_resources
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.utils.common import ray_namespace
 from transfer_queue.utils.logging_utils import get_logger
@@ -236,32 +237,36 @@ def init(conf: DictConfig | None = None) -> DictConfig | None:
     controller_zmq_info = process_zmq_server_info(_TQ_CONTROLLER)
     final_conf.controller.zmq_info = controller_zmq_info
 
-    final_conf = _maybe_create_tq_storage(final_conf)
+    try:
+        final_conf = _maybe_create_tq_storage(final_conf)
 
-    ray.get(_TQ_CONTROLLER.store_config.remote(final_conf))
-    logger.info(f"TransferQueue config: {final_conf}")
-
-    # start Prometheus metrics exporter if enabled
-    metrics_conf = final_conf.get("metrics", {})
-    if metrics_conf.get("enabled", False):
-        metrics_port = metrics_conf.get("port", 0)
-        metrics_endpoint = ray.get(_TQ_CONTROLLER.start_metrics.remote(port=metrics_port))
-        final_conf.metrics.enabled = True
-        final_conf.metrics.endpoint = metrics_endpoint
-        # Update stored config so other processes can discover the endpoint
         ray.get(_TQ_CONTROLLER.store_config.remote(final_conf))
-        # Register storage units for metrics collection (SimpleStorage only)
-        if final_conf.backend.storage_backend == "SimpleStorage":
-            storage_zmq_info = final_conf.backend.SimpleStorage.get("zmq_info")
-            if storage_zmq_info:
-                ray.get(_TQ_CONTROLLER.register_storage_units_for_metrics.remote(storage_zmq_info))
-            # Start metrics exporter on each storage unit
-            if _TQ_STORAGE and "SimpleStorage" in _TQ_STORAGE:
-                futures = [handle.start_metrics.remote(port=0) for handle in _TQ_STORAGE["SimpleStorage"].values()]
-                ray.get(futures)
-        logger.info(f"Prometheus metrics endpoint: http://{metrics_endpoint}/metrics")
+        logger.info(f"TransferQueue config: {final_conf}")
 
-    _maybe_create_tq_client(final_conf)
+        # start Prometheus metrics exporter if enabled
+        metrics_conf = final_conf.get("metrics", {})
+        if metrics_conf.get("enabled", False):
+            metrics_port = metrics_conf.get("port", 0)
+            metrics_endpoint = ray.get(_TQ_CONTROLLER.start_metrics.remote(port=metrics_port))
+            final_conf.metrics.enabled = True
+            final_conf.metrics.endpoint = metrics_endpoint
+            # Update stored config so other processes can discover the endpoint
+            ray.get(_TQ_CONTROLLER.store_config.remote(final_conf))
+            # Register storage units for metrics collection (SimpleStorage only)
+            if final_conf.backend.storage_backend == "SimpleStorage":
+                storage_zmq_info = final_conf.backend.SimpleStorage.get("zmq_info")
+                if storage_zmq_info:
+                    ray.get(_TQ_CONTROLLER.register_storage_units_for_metrics.remote(storage_zmq_info))
+                # Start metrics exporter on each storage unit
+                if _TQ_STORAGE and "SimpleStorage" in _TQ_STORAGE:
+                    futures = [handle.start_metrics.remote(port=0) for handle in _TQ_STORAGE["SimpleStorage"].values()]
+                    ray.get(futures)
+            logger.info(f"Prometheus metrics endpoint: http://{metrics_endpoint}/metrics")
+
+        _maybe_create_tq_client(final_conf)
+    except Exception:
+        close()
+        raise
     return final_conf
 
 
@@ -328,6 +333,8 @@ def close():
                             pass
                 elif key == "Yuanrong":
                     cleanup_yuanrong_resources(value)
+                elif key == "NixlStore":
+                    cleanup_nixl_store_resources(value)
                 else:
                     logger.warning(f"close for _TQ_STORAGE with key {key} is not supported for now.")
 
